@@ -158,19 +158,6 @@ typedef struct
 } TokenSegment;
 
 // ============================================================================
-// 合并候选（用于优先队列）
-// ============================================================================
-typedef struct
-{
-    int left_idx;     // 左 token 在原始数组中的索引
-    int right_idx;    // 右 token 索引（用于验证）
-    int32_t left_id;  // 左 token 当时的值
-    int32_t right_id; // 右 token 当时的值
-    int32_t new_id;   // 合并后的新 token ID
-    int priority;     // 优先级（越小越优先）
-} MergeCandidate;
-
-// ============================================================================
 // 辅助函数 (内存安全复制)
 // ============================================================================
 
@@ -837,77 +824,36 @@ static int find_merge_rule(BBPETokenizer *tok, int32_t left, int32_t right,
     return 0;
 }
 
-// ============================================================================
-// 优先队列辅助函数
-// ============================================================================
-
 /**
- * @brief 交换两个 MergeCandidate 结构体
+ * @brief 在 token 序列中查找优先级最高的可合并位置
+ * @param ids token ID 数组
+ * @param token_count 当前 token 数量
+ * @param tok 分词器句柄
+ * @param out_new_id 输出合并后的新 token ID
+ * @return 最佳合并位置的索引 (从 0 开始)，若无可合并则返回 -1
  */
-static void heap_swap(MergeCandidate *a, MergeCandidate *b)
+static int find_best_merge(int32_t *ids, size_t token_count, BBPETokenizer *tok, int32_t *out_new_id)
 {
-    MergeCandidate tmp = *a;
-    *a = *b;
-    *b = tmp;
-}
+    int best_idx = -1;
+    int min_priority = INT32_MAX;
 
-/**
- * @brief 向最小堆中插入一个候选
- * @param heap 堆数组的指针
- * @param size 当前堆大小（会更新）
- * @param val 待插入值
- * @return 0 成功，-1 内存不足
- */
-static int heap_push(MergeCandidate **heap, size_t *size, MergeCandidate val)
-{
-    MergeCandidate *new_heap = (MergeCandidate *)realloc(*heap, (*size + 1) * sizeof(MergeCandidate));
-    if (!new_heap)
-        return -1;
-    *heap = new_heap;
-    (*heap)[*size] = val;
-    size_t i = (*size)++;
-    while (i > 0)
+    for (size_t i = 0; i < token_count - 1; i++)
     {
-        size_t p = (i - 1) / 2;
-        if ((*heap)[p].priority <= (*heap)[i].priority)
-            break;
-        heap_swap(&(*heap)[p], &(*heap)[i]);
-        i = p;
+        int32_t left = ids[i];
+        int32_t right = ids[i + 1];
+        int32_t new_id, priority;
+        if (find_merge_rule(tok, left, right, &new_id, &priority))
+        {
+            if (priority < min_priority)
+            {
+                min_priority = priority;
+                best_idx = (int)i;
+                *out_new_id = new_id;
+            }
+        }
     }
-    return 0;
+    return best_idx;
 }
-
-/**
- * @brief 从最小堆中弹出堆顶元素
- * @param heap 堆数组的指针
- * @param size 当前堆大小（会更新）
- * @return 堆顶元素（调用前需确保 size>0）
- */
-static MergeCandidate heap_pop(MergeCandidate **heap, size_t *size)
-{
-    MergeCandidate top = (*heap)[0];
-    (*heap)[0] = (*heap)[--(*size)];
-    size_t i = 0;
-    while (1)
-    {
-        size_t left = 2 * i + 1;
-        size_t right = 2 * i + 2;
-        size_t smallest = i;
-        if (left < *size && (*heap)[left].priority < (*heap)[smallest].priority)
-            smallest = left;
-        if (right < *size && (*heap)[right].priority < (*heap)[smallest].priority)
-            smallest = right;
-        if (smallest == i)
-            break;
-        heap_swap(&(*heap)[i], &(*heap)[smallest]);
-        i = smallest;
-    }
-    return top;
-}
-
-// ============================================================================
-// 改进后的 encode_chunk 函数（使用优先队列）
-// ============================================================================
 
 /**
  * @brief 将单个文本块编码为 token IDs 并追加到输出结构
@@ -922,11 +868,11 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
     if (chunk_len == 0)
         return BBPE_OK;
 
-    // 初始 token 序列
+    // 初始时，将每个字节映射为 token ID
     int32_t *ids = (int32_t *)malloc(sizeof(int32_t) * chunk_len);
     if (!ids)
         return BBPE_ERR_MEMORY;
-    size_t token_count = chunk_len;
+    size_t token_count = 0;
 
     for (size_t i = 0; i < chunk_len; i++)
     {
@@ -934,6 +880,7 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
         const char *vocab_str = tok->byte_vocab_strs[byte];
         VocabEntry *vocab_entry = NULL;
         HASH_FIND_STR(tok->vocab_map, vocab_str, vocab_entry);
+        // 如果预计算字符串未找到，回退到原始字节字符串 (极少情况)
         if (!vocab_entry)
         {
             char raw_byte[2] = {(char)byte, '\0'};
@@ -944,207 +891,38 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
             free(ids);
             return BBPE_ERR_TOKEN_NOT_FOUND;
         }
-        ids[i] = vocab_entry->id;
+        ids[token_count++] = vocab_entry->id;
     }
 
-    if (token_count <= 1)
+    // 反复应用合并规则直到无法合并
+    while (token_count > 1)
     {
-        size_t old_count = out_accum->count;
-        out_accum->count += token_count;
-        int32_t *new_ids = (int32_t *)realloc(out_accum->ids, sizeof(int32_t) * out_accum->count);
-        if (!new_ids)
-        {
-            free(ids);
-            return BBPE_ERR_MEMORY;
-        }
-        out_accum->ids = new_ids;
-        memcpy(out_accum->ids + old_count, ids, token_count * sizeof(int32_t));
-        free(ids);
-        return BBPE_OK;
-    }
-
-    // 链表结构
-    int *prev = (int *)malloc(token_count * sizeof(int));
-    int *next = (int *)malloc(token_count * sizeof(int));
-    int *alive = (int *)malloc(token_count * sizeof(int)); // 1 表示存活
-    if (!prev || !next || !alive)
-    {
-        free(ids);
-        free(prev);
-        free(next);
-        free(alive);
-        return BBPE_ERR_MEMORY;
-    }
-    for (size_t i = 0; i < token_count; i++)
-    {
-        prev[i] = (i == 0) ? -1 : (int)(i - 1);
-        next[i] = (i == token_count - 1) ? -1 : (int)(i + 1);
-        alive[i] = 1;
-    }
-
-    // 优先队列
-    MergeCandidate *heap = NULL;
-    size_t heap_size = 0;
-
-    // 初始将所有可合并对入堆
-    for (size_t i = 0; i < token_count - 1; i++)
-    {
-        int left_id = ids[i];
-        int right_id = ids[i + 1];
-        int32_t new_id, priority;
-        if (find_merge_rule(tok, left_id, right_id, &new_id, &priority))
-        {
-            MergeCandidate cand = {
-                .left_idx = (int)i,
-                .right_idx = (int)(i + 1),
-                .left_id = left_id,
-                .right_id = right_id,
-                .new_id = new_id,
-                .priority = priority};
-            if (heap_push(&heap, &heap_size, cand) != 0)
-            {
-                free(prev);
-                free(next);
-                free(alive);
-                free(ids);
-                return BBPE_ERR_MEMORY;
-            }
-        }
-    }
-
-    // 主合并循环
-    while (heap_size > 0)
-    {
-        MergeCandidate cand = heap_pop(&heap, &heap_size);
-        int left_idx = cand.left_idx;
-        int right_idx = cand.right_idx;
-
-        // 验证候选有效性
-        if (!alive[left_idx] || !alive[right_idx])
-            continue;
-        if (next[left_idx] != right_idx || prev[right_idx] != left_idx)
-            continue;
-        if (ids[left_idx] != cand.left_id || ids[right_idx] != cand.right_id)
-            continue;
-
-        // 执行合并
-        ids[left_idx] = cand.new_id;
-        int right_next = next[right_idx];
-        if (right_next != -1)
-            prev[right_next] = left_idx;
-        next[left_idx] = right_next;
-        alive[right_idx] = 0;
-
-        // 更新受影响的相邻对
-        // 左邻对 (prev[left_idx], left_idx)
-        int left_prev = prev[left_idx];
-        if (left_prev != -1 && alive[left_prev])
-        {
-            int32_t new_id2, prio2;
-            if (find_merge_rule(tok, ids[left_prev], ids[left_idx], &new_id2, &prio2))
-            {
-                MergeCandidate new_cand = {
-                    .left_idx = left_prev,
-                    .right_idx = left_idx,
-                    .left_id = ids[left_prev],
-                    .right_id = ids[left_idx],
-                    .new_id = new_id2,
-                    .priority = prio2};
-                if (heap_push(&heap, &heap_size, new_cand) != 0)
-                {
-                    free(prev);
-                    free(next);
-                    free(alive);
-                    free(ids);
-                    free(heap);
-                    return BBPE_ERR_MEMORY;
-                }
-            }
-        }
-        // 右邻对 (left_idx, right_next)
-        if (right_next != -1 && alive[right_next])
-        {
-            int32_t new_id2, prio2;
-            if (find_merge_rule(tok, ids[left_idx], ids[right_next], &new_id2, &prio2))
-            {
-                MergeCandidate new_cand = {
-                    .left_idx = left_idx,
-                    .right_idx = right_next,
-                    .left_id = ids[left_idx],
-                    .right_id = ids[right_next],
-                    .new_id = new_id2,
-                    .priority = prio2};
-                if (heap_push(&heap, &heap_size, new_cand) != 0)
-                {
-                    free(prev);
-                    free(next);
-                    free(alive);
-                    free(ids);
-                    free(heap);
-                    return BBPE_ERR_MEMORY;
-                }
-            }
-        }
-    }
-
-    // 按链表顺序收集最终 token
-    int32_t *final_ids = (int32_t *)malloc(token_count * sizeof(int32_t));
-    if (!final_ids)
-    {
-        free(prev);
-        free(next);
-        free(alive);
-        free(ids);
-        free(heap);
-        return BBPE_ERR_MEMORY;
-    }
-    size_t final_count = 0;
-    int head = -1;
-    for (size_t i = 0; i < token_count; i++)
-    {
-        if (alive[i] && prev[i] == -1)
-        {
-            head = (int)i;
+        int32_t new_id;
+        int best_idx = find_best_merge(ids, token_count, tok, &new_id);
+        if (best_idx == -1)
             break;
-        }
-    }
-    if (head == -1)
-    {
-        free(final_ids);
-        free(prev);
-        free(next);
-        free(alive);
-        free(ids);
-        free(heap);
-        return BBPE_ERR_INVALID_INPUT;
-    }
-    for (int cur = head; cur != -1; cur = next[cur])
-        final_ids[final_count++] = ids[cur];
 
-    // 追加到输出
+        ids[best_idx] = new_id;
+        // 左移删除后面的元素
+        for (size_t k = best_idx + 1; k < token_count - 1; k++)
+        {
+            ids[k] = ids[k + 1];
+        }
+        token_count--;
+    }
+
+    // 将结果追加到 out_accum
     size_t old_count = out_accum->count;
-    out_accum->count += final_count;
+    out_accum->count += token_count;
     int32_t *new_ids = (int32_t *)realloc(out_accum->ids, sizeof(int32_t) * out_accum->count);
     if (!new_ids)
     {
-        free(final_ids);
-        free(prev);
-        free(next);
-        free(alive);
         free(ids);
-        free(heap);
         return BBPE_ERR_MEMORY;
     }
     out_accum->ids = new_ids;
-    memcpy(out_accum->ids + old_count, final_ids, final_count * sizeof(int32_t));
-
-    // 清理
-    free(final_ids);
-    free(prev);
-    free(next);
-    free(alive);
+    memcpy(out_accum->ids + old_count, ids, token_count * sizeof(int32_t));
     free(ids);
-    free(heap);
     return BBPE_OK;
 }
 
