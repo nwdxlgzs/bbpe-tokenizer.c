@@ -1,8 +1,8 @@
 /**
  * @file bbpe_tokenizer.c
- * @brief BBPE (Byte-Level Byte Pair Encoding) 分词器完整实现
+ * @brief BBPE (Byte-Level Byte Pair Encoding) 分词器完整实现（优先队列优化版，修正优先级相同问题）
  *
- * 该文件基于 HuggingFace tokenizer.json 格式，实现了 ByteLevel BPE 分词器推理时的大部份功能（部分功能仅实现未做验证）。
+ * 该文件基于 HuggingFace tokenizer.json 格式，实现了 ByteLevel BPE 分词器推理时的大部份功能。
  * 功能包括：
  * - 从 JSON 加载词汇表、合并规则、预分词器配置、特殊 token
  * - 支持 ByteLevel 预分词（可选添加前缀空格）和正则分割预分词
@@ -16,6 +16,8 @@
  * - pcre2：正则引擎
  * - uthash：哈希表实现
  *
+ * 优化：使用优先队列（最小堆）加速 BPE 合并过程，复杂度 O(n log n)。
+ * 修正：堆比较加入位置信息（节点地址），确保优先级相同时选择最左边的合并，结果与原始线性扫描一致。
  */
 
 #include "bbpe_tokenizer.h"
@@ -156,6 +158,43 @@ typedef struct
     char *text;     /* 当 is_special==0 时有效，为普通文本段 (需要释放) */
     int special_id; /* 当 is_special==1 时有效，为特殊 token 的 ID */
 } TokenSegment;
+
+// ============================================================================
+// 优先队列（最小堆）相关结构（修正：比较时加入地址作为第二关键字）
+// ============================================================================
+
+/**
+ * @brief 链表节点，用于表示 BPE 合并过程中的一个 token
+ */
+typedef struct TokenNode
+{
+    int32_t id;             /* token ID */
+    struct TokenNode *prev; /* 前驱节点 */
+    struct TokenNode *next; /* 后继节点 */
+} TokenNode;
+
+/**
+ * @brief 堆元素，表示一个相邻对候选
+ */
+typedef struct
+{
+    TokenNode *left_node;  /* 左节点指针 */
+    TokenNode *right_node; /* 右节点指针 */
+    int32_t left_id;       /* 左节点当时的 ID，用于验证 */
+    int32_t right_id;      /* 右节点当时的 ID，用于验证 */
+    int32_t priority;      /* 优先级（数值越小越优先） */
+    int32_t new_id;        /* 合并后的新 token ID */
+} HeapItem;
+
+/**
+ * @brief 最小堆结构
+ */
+typedef struct
+{
+    HeapItem *items; /* 堆数组 */
+    int size;        /* 当前元素个数 */
+    int capacity;    /* 容量 */
+} MinHeap;
 
 // ============================================================================
 // 辅助函数 (内存安全复制)
@@ -779,7 +818,7 @@ static BBPEStatus pre_tokenize(BBPETokenizer *tok, const char *text, PreTokenize
 }
 
 // ============================================================================
-// BPE 合并相关函数
+// 合并规则查找
 // ============================================================================
 
 /**
@@ -824,36 +863,144 @@ static int find_merge_rule(BBPETokenizer *tok, int32_t left, int32_t right,
     return 0;
 }
 
-/**
- * @brief 在 token 序列中查找优先级最高的可合并位置
- * @param ids token ID 数组
- * @param token_count 当前 token 数量
- * @param tok 分词器句柄
- * @param out_new_id 输出合并后的新 token ID
- * @return 最佳合并位置的索引 (从 0 开始)，若无可合并则返回 -1
- */
-static int find_best_merge(int32_t *ids, size_t token_count, BBPETokenizer *tok, int32_t *out_new_id)
-{
-    int best_idx = -1;
-    int min_priority = INT32_MAX;
+// ============================================================================
+// 优先队列（最小堆）辅助函数（修正：比较优先级和左节点地址）
+// ============================================================================
 
-    for (size_t i = 0; i < token_count - 1; i++)
+/**
+ * @brief 初始化最小堆
+ * @param capacity 初始容量
+ * @return 堆指针，失败返回 NULL
+ */
+static MinHeap *heap_create(int capacity)
+{
+    MinHeap *heap = (MinHeap *)malloc(sizeof(MinHeap));
+    if (!heap)
+        return NULL;
+    heap->items = (HeapItem *)malloc(sizeof(HeapItem) * capacity);
+    if (!heap->items)
     {
-        int32_t left = ids[i];
-        int32_t right = ids[i + 1];
-        int32_t new_id, priority;
-        if (find_merge_rule(tok, left, right, &new_id, &priority))
-        {
-            if (priority < min_priority)
-            {
-                min_priority = priority;
-                best_idx = (int)i;
-                *out_new_id = new_id;
-            }
-        }
+        free(heap);
+        return NULL;
     }
-    return best_idx;
+    heap->size = 0;
+    heap->capacity = capacity;
+    return heap;
 }
+
+/**
+ * @brief 销毁堆
+ */
+static void heap_free(MinHeap *heap)
+{
+    if (heap)
+    {
+        free(heap->items);
+        free(heap);
+    }
+}
+
+/**
+ * @brief 交换两个堆元素
+ */
+static void heap_swap(HeapItem *a, HeapItem *b)
+{
+    HeapItem tmp = *a;
+    *a = *b;
+    *b = tmp;
+}
+
+/**
+ * @brief 比较两个堆元素，若 a 应排在 b 前面则返回 1（即 a 优先级更小或优先级相同且左节点地址更小）
+ */
+static int heap_item_less(HeapItem *a, HeapItem *b)
+{
+    if (a->priority != b->priority)
+        return a->priority < b->priority;
+    // 优先级相同，比较左节点地址（地址小的代表更左边）
+    return (uintptr_t)a->left_node < (uintptr_t)b->left_node;
+}
+
+/**
+ * @brief 上浮操作
+ */
+static void heap_up(MinHeap *heap, int idx)
+{
+    while (idx > 0)
+    {
+        int parent = (idx - 1) / 2;
+        if (heap_item_less(&heap->items[parent], &heap->items[idx]))
+            break; // 父节点已经更小，无需交换
+        heap_swap(&heap->items[parent], &heap->items[idx]);
+        idx = parent;
+    }
+}
+
+/**
+ * @brief 下沉操作
+ */
+static void heap_down(MinHeap *heap, int idx)
+{
+    int size = heap->size;
+    while (1)
+    {
+        int left = 2 * idx + 1;
+        int right = 2 * idx + 2;
+        int smallest = idx;
+
+        if (left < size && heap_item_less(&heap->items[left], &heap->items[smallest]))
+            smallest = left;
+        if (right < size && heap_item_less(&heap->items[right], &heap->items[smallest]))
+            smallest = right;
+
+        if (smallest == idx)
+            break;
+
+        heap_swap(&heap->items[idx], &heap->items[smallest]);
+        idx = smallest;
+    }
+}
+
+/**
+ * @brief 向堆中插入一个元素
+ */
+static void heap_push(MinHeap *heap, HeapItem item)
+{
+    if (heap->size >= heap->capacity)
+    {
+        heap->capacity *= 2;
+        heap->items = (HeapItem *)realloc(heap->items, sizeof(HeapItem) * heap->capacity);
+    }
+    heap->items[heap->size] = item;
+    heap_up(heap, heap->size);
+    heap->size++;
+}
+
+/**
+ * @brief 从堆顶弹出一个元素
+ * @return 弹出元素，若堆为空则返回的 priority 为 INT32_MAX
+ */
+static HeapItem heap_pop(MinHeap *heap)
+{
+    HeapItem top = {0};
+    if (heap->size == 0)
+    {
+        top.priority = INT32_MAX; // 标记无效
+        return top;
+    }
+    top = heap->items[0];
+    heap->size--;
+    if (heap->size > 0)
+    {
+        heap->items[0] = heap->items[heap->size];
+        heap_down(heap, 0);
+    }
+    return top;
+}
+
+// ============================================================================
+// BPE 合并函数（使用优先队列优化，修正优先级相同问题）
+// ============================================================================
 
 /**
  * @brief 将单个文本块编码为 token IDs 并追加到输出结构
@@ -868,61 +1015,172 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
     if (chunk_len == 0)
         return BBPE_OK;
 
-    // 初始时，将每个字节映射为 token ID
-    int32_t *ids = (int32_t *)malloc(sizeof(int32_t) * chunk_len);
-    if (!ids)
+    // 1. 分配节点数组，建立双向链表
+    TokenNode *nodes = (TokenNode *)malloc(chunk_len * sizeof(TokenNode));
+    if (!nodes)
         return BBPE_ERR_MEMORY;
-    size_t token_count = 0;
 
+    TokenNode *head = &nodes[0];
+    TokenNode *tail = &nodes[chunk_len - 1];
     for (size_t i = 0; i < chunk_len; i++)
     {
         uint8_t byte = (uint8_t)chunk[i];
         const char *vocab_str = tok->byte_vocab_strs[byte];
         VocabEntry *vocab_entry = NULL;
         HASH_FIND_STR(tok->vocab_map, vocab_str, vocab_entry);
-        // 如果预计算字符串未找到，回退到原始字节字符串 (极少情况)
-        if (!vocab_entry)
+        if (!vocab_entry) // 回退到原始字节字符串
         {
             char raw_byte[2] = {(char)byte, '\0'};
             HASH_FIND_STR(tok->vocab_map, raw_byte, vocab_entry);
         }
         if (!vocab_entry)
         {
-            free(ids);
+            free(nodes);
             return BBPE_ERR_TOKEN_NOT_FOUND;
         }
-        ids[token_count++] = vocab_entry->id;
+        nodes[i].id = vocab_entry->id;
+        nodes[i].prev = (i > 0) ? &nodes[i - 1] : NULL;
+        nodes[i].next = (i < chunk_len - 1) ? &nodes[i + 1] : NULL;
     }
 
-    // 反复应用合并规则直到无法合并
-    while (token_count > 1)
+    // 2. 初始化优先队列
+    MinHeap *heap = heap_create(chunk_len);
+    if (!heap)
     {
-        int32_t new_id;
-        int best_idx = find_best_merge(ids, token_count, tok, &new_id);
-        if (best_idx == -1)
-            break;
-
-        ids[best_idx] = new_id;
-        // 左移删除后面的元素
-        for (size_t k = best_idx + 1; k < token_count - 1; k++)
-        {
-            ids[k] = ids[k + 1];
-        }
-        token_count--;
+        free(nodes);
+        return BBPE_ERR_MEMORY;
     }
 
-    // 将结果追加到 out_accum
+    // 3. 将所有可能的相邻对插入堆
+    for (TokenNode *node = head; node && node->next; node = node->next)
+    {
+        int32_t left_id = node->id;
+        int32_t right_id = node->next->id;
+        int32_t new_id, priority;
+        if (find_merge_rule(tok, left_id, right_id, &new_id, &priority))
+        {
+            HeapItem item;
+            item.left_node = node;
+            item.right_node = node->next;
+            item.left_id = left_id;
+            item.right_id = right_id;
+            item.priority = priority;
+            item.new_id = new_id;
+            heap_push(heap, item);
+        }
+    }
+
+    // 4. 主合并循环
+    while (heap->size > 0)
+    {
+        HeapItem best = heap_pop(heap);
+        if (best.priority == INT32_MAX)
+            break; // 堆空
+
+        // 验证该对是否仍然有效
+        TokenNode *left = best.left_node;
+        TokenNode *right = best.right_node;
+
+        // 检查指针关系：必须相邻且仍在链表中
+        if (left->next != right || right->prev != left)
+            continue;
+
+        // 检查 ID 是否与入堆时一致（未被其他合并改变）
+        if (left->id != best.left_id || right->id != best.right_id)
+            continue;
+
+        // 执行合并：左节点复用，右节点从链表中移除
+        left->id = best.new_id; // 更新为合并后的 token ID
+
+        // 记录右节点的后继
+        TokenNode *right_next = right->next;
+
+        // 调整链表：左节点的 next 指向 right_next
+        left->next = right_next;
+        if (right_next)
+            right_next->prev = left;
+
+        // 右节点从链表中脱离（不再被使用）
+        right->prev = NULL;
+        right->next = NULL;
+
+        // 插入新的左边对（left 的前驱与 left）
+        if (left->prev)
+        {
+            int32_t lleft_id = left->prev->id;
+            int32_t lright_id = left->id;
+            int32_t new_id2, priority2;
+            if (find_merge_rule(tok, lleft_id, lright_id, &new_id2, &priority2))
+            {
+                HeapItem item;
+                item.left_node = left->prev;
+                item.right_node = left;
+                item.left_id = lleft_id;
+                item.right_id = lright_id;
+                item.priority = priority2;
+                item.new_id = new_id2;
+                heap_push(heap, item);
+            }
+        }
+
+        // 插入新的右边对（left 与 left 的后继）
+        if (left->next)
+        {
+            int32_t lleft_id = left->id;
+            int32_t lright_id = left->next->id;
+            int32_t new_id2, priority2;
+            if (find_merge_rule(tok, lleft_id, lright_id, &new_id2, &priority2))
+            {
+                HeapItem item;
+                item.left_node = left;
+                item.right_node = left->next;
+                item.left_id = lleft_id;
+                item.right_id = lright_id;
+                item.priority = priority2;
+                item.new_id = new_id2;
+                heap_push(heap, item);
+            }
+        }
+
+        // 注意：原先涉及 right 节点的其他堆条目将在被弹出时因验证失败而丢弃
+    }
+
+    // 5. 收集结果：遍历链表收集所有存活节点的 ID
+    size_t token_count = 0;
+    for (TokenNode *node = head; node; node = node->next)
+        token_count++;
+
+    int32_t *ids = (int32_t *)malloc(sizeof(int32_t) * token_count);
+    if (!ids)
+    {
+        heap_free(heap);
+        free(nodes);
+        return BBPE_ERR_MEMORY;
+    }
+
+    size_t idx = 0;
+    for (TokenNode *node = head; node; node = node->next)
+        ids[idx++] = node->id;
+
+    // 6. 追加到 out_accum
     size_t old_count = out_accum->count;
     out_accum->count += token_count;
     int32_t *new_ids = (int32_t *)realloc(out_accum->ids, sizeof(int32_t) * out_accum->count);
     if (!new_ids)
     {
         free(ids);
+        heap_free(heap);
+        free(nodes);
         return BBPE_ERR_MEMORY;
     }
     out_accum->ids = new_ids;
     memcpy(out_accum->ids + old_count, ids, token_count * sizeof(int32_t));
+
+    // 7. 清理
     free(ids);
+    heap_free(heap);
+    free(nodes);
+
     return BBPE_OK;
 }
 
