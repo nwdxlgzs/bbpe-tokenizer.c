@@ -17,7 +17,7 @@
  * - uthash：哈希表实现
  *
  * 优化：使用优先队列（最小堆）加速 BPE 合并过程，复杂度 O(n log n)。
- * 修正：堆比较加入位置信息（节点地址），确保优先级相同时选择最左边的合并，结果与原始线性扫描一致。
+ * 修正：堆比较加入位置信息（节点原始下标），确保优先级相同时选择最左边的合并，结果与原始线性扫描一致。
  */
 
 #include "bbpe_tokenizer.h"
@@ -26,6 +26,7 @@
 #include <string.h>
 #include <ctype.h>
 #include <limits.h>
+#include <assert.h>
 
 #include "cJSON.h"
 #include "pcre2.h"
@@ -160,7 +161,7 @@ typedef struct
 } TokenSegment;
 
 // ============================================================================
-// 优先队列（最小堆）相关结构（修正：比较时加入地址作为第二关键字）
+// 优先队列（最小堆）相关结构（修正：比较时加入节点位置作为第二关键字）
 // ============================================================================
 
 /**
@@ -169,6 +170,7 @@ typedef struct
 typedef struct TokenNode
 {
     int32_t id;             /* token ID */
+    int pos;                /* 节点在原始序列中的位置（字符索引），用于确定最左边合并 */
     struct TokenNode *prev; /* 前驱节点 */
     struct TokenNode *next; /* 后继节点 */
 } TokenNode;
@@ -351,6 +353,7 @@ static TokenSegment *extract_special_tokens(BBPETokenizer *tok, const char *text
                         TokenSegment *new_seg = (TokenSegment *)realloc(segments, capacity * sizeof(TokenSegment));
                         if (!new_seg)
                         {
+                            // 释放已分配的 segments 及其中的 text
                             for (size_t i = 0; i < count; i++)
                                 if (!segments[i].is_special && segments[i].text)
                                     free(segments[i].text);
@@ -596,8 +599,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                         free(chunks[i]);
                     free(chunks);
                     pcre2_match_data_free(match_data);
-                    out->chunks = NULL; // 确保输出为空
-                    out->count = 0;
                     return BBPE_ERR_MEMORY;
                 }
                 memcpy(chunk, text + last_end, chunk_len);
@@ -611,8 +612,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                         free(chunks[i]);
                     free(chunks);
                     pcre2_match_data_free(match_data);
-                    out->chunks = NULL;
-                    out->count = 0;
                     return BBPE_ERR_MEMORY;
                 }
                 chunks = tmp;
@@ -628,8 +627,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                     free(chunks[i]);
                 free(chunks);
                 pcre2_match_data_free(match_data);
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
             }
             memcpy(match_chunk, text + start, match_len);
@@ -643,8 +640,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                     free(chunks[i]);
                 free(chunks);
                 pcre2_match_data_free(match_data);
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
             }
             chunks = tmp;
@@ -667,8 +662,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                     free(chunks[i]);
                 free(chunks);
                 pcre2_match_data_free(match_data);
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
             }
             memcpy(chunk, text + last_end, rem_len);
@@ -682,8 +675,6 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
                     free(chunks[i]);
                 free(chunks);
                 pcre2_match_data_free(match_data);
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
             }
             chunks = tmp;
@@ -697,17 +688,11 @@ static BBPEStatus apply_single_pre_tokenizer(PreTokenizerNode *node, const char 
         {
             chunks = (char **)malloc(sizeof(char *));
             if (!chunks)
-            {
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
-            }
             chunks[0] = strdup(text);
             if (!chunks[0])
             {
                 free(chunks);
-                out->chunks = NULL;
-                out->count = 0;
                 return BBPE_ERR_MEMORY;
             }
             count = 1;
@@ -765,8 +750,8 @@ static BBPEStatus pre_tokenize(BBPETokenizer *tok, const char *text, PreTokenize
 
             if (part.count > 0)
             {
-                // 合并 part 到 next
-                if (next.count > SIZE_MAX / sizeof(char *) - part.count)
+                // 合并 part 到 next，检查溢出
+                if (next.count > SIZE_MAX - part.count)
                 {
                     free_pre_tokenized(&part);
                     for (size_t k = 0; k < current.count; k++)
@@ -833,6 +818,8 @@ static BBPEStatus pre_tokenize(BBPETokenizer *tok, const char *text, PreTokenize
 static int find_merge_rule(BBPETokenizer *tok, int32_t left, int32_t right,
                            int32_t *out_new_id, int32_t *out_priority)
 {
+    if (!tok->rule_rows)
+        return 0;
     if (left < 0 || left >= tok->vocab_size)
         return 0;
     MergeRuleRow *row = &tok->rule_rows[left];
@@ -864,7 +851,7 @@ static int find_merge_rule(BBPETokenizer *tok, int32_t left, int32_t right,
 }
 
 // ============================================================================
-// 优先队列（最小堆）辅助函数（修正：比较优先级和左节点地址）
+// 优先队列（最小堆）辅助函数（修正：比较优先级和左节点位置）
 // ============================================================================
 
 /**
@@ -911,14 +898,15 @@ static void heap_swap(HeapItem *a, HeapItem *b)
 }
 
 /**
- * @brief 比较两个堆元素，若 a 应排在 b 前面则返回 1（即 a 优先级更小或优先级相同且左节点地址更小）
+ * @brief 比较两个堆元素，若 a 应排在 b 前面则返回 1（即 a 优先级更小或优先级相同且左节点位置更小）
  */
 static int heap_item_less(HeapItem *a, HeapItem *b)
 {
     if (a->priority != b->priority)
         return a->priority < b->priority;
-    // 优先级相同，比较左节点地址（地址小的代表更左边）
-    return (uintptr_t)a->left_node < (uintptr_t)b->left_node;
+    // 优先级相同，比较左节点在原始序列中的位置（位置小的代表更左边）
+    assert(a->left_node != NULL && b->left_node != NULL);
+    return a->left_node->pos < b->left_node->pos;
 }
 
 /**
@@ -963,17 +951,26 @@ static void heap_down(MinHeap *heap, int idx)
 
 /**
  * @brief 向堆中插入一个元素
+ * @return BBPE_OK 成功，BBPE_ERR_MEMORY 内存不足
  */
-static void heap_push(MinHeap *heap, HeapItem item)
+static int heap_push(MinHeap *heap, HeapItem item)
 {
     if (heap->size >= heap->capacity)
     {
-        heap->capacity *= 2;
-        heap->items = (HeapItem *)realloc(heap->items, sizeof(HeapItem) * heap->capacity);
+        // 检查容量乘法是否溢出
+        if (heap->capacity > SIZE_MAX / (2 * sizeof(HeapItem)))
+            return BBPE_ERR_MEMORY;
+        int new_cap = heap->capacity * 2;
+        HeapItem *new_items = (HeapItem *)realloc(heap->items, sizeof(HeapItem) * new_cap);
+        if (!new_items)
+            return BBPE_ERR_MEMORY;
+        heap->items = new_items;
+        heap->capacity = new_cap;
     }
     heap->items[heap->size] = item;
     heap_up(heap, heap->size);
     heap->size++;
+    return BBPE_OK;
 }
 
 /**
@@ -1015,10 +1012,17 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
     if (chunk_len == 0)
         return BBPE_OK;
 
+    BBPEStatus status = BBPE_OK;
+    TokenNode *nodes = NULL;
+    MinHeap *heap = NULL;
+
     // 1. 分配节点数组，建立双向链表
-    TokenNode *nodes = (TokenNode *)malloc(chunk_len * sizeof(TokenNode));
+    nodes = (TokenNode *)malloc(chunk_len * sizeof(TokenNode));
     if (!nodes)
-        return BBPE_ERR_MEMORY;
+    {
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
+    }
 
     TokenNode *head = &nodes[0];
     TokenNode *tail = &nodes[chunk_len - 1];
@@ -1035,20 +1039,21 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
         }
         if (!vocab_entry)
         {
-            free(nodes);
-            return BBPE_ERR_TOKEN_NOT_FOUND;
+            status = BBPE_ERR_TOKEN_NOT_FOUND;
+            goto cleanup;
         }
         nodes[i].id = vocab_entry->id;
+        nodes[i].pos = (int)i; // 记录原始位置
         nodes[i].prev = (i > 0) ? &nodes[i - 1] : NULL;
         nodes[i].next = (i < chunk_len - 1) ? &nodes[i + 1] : NULL;
     }
 
     // 2. 初始化优先队列
-    MinHeap *heap = heap_create(chunk_len);
+    heap = heap_create(chunk_len);
     if (!heap)
     {
-        free(nodes);
-        return BBPE_ERR_MEMORY;
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
     }
 
     // 3. 将所有可能的相邻对插入堆
@@ -1066,7 +1071,12 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
             item.right_id = right_id;
             item.priority = priority;
             item.new_id = new_id;
-            heap_push(heap, item);
+            int ret = heap_push(heap, item);
+            if (ret != BBPE_OK)
+            {
+                status = ret;
+                goto cleanup;
+            }
         }
     }
 
@@ -1119,7 +1129,12 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
                 item.right_id = lright_id;
                 item.priority = priority2;
                 item.new_id = new_id2;
-                heap_push(heap, item);
+                int ret = heap_push(heap, item);
+                if (ret != BBPE_OK)
+                {
+                    status = ret;
+                    goto cleanup;
+                }
             }
         }
 
@@ -1138,7 +1153,12 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
                 item.right_id = lright_id;
                 item.priority = priority2;
                 item.new_id = new_id2;
-                heap_push(heap, item);
+                int ret = heap_push(heap, item);
+                if (ret != BBPE_OK)
+                {
+                    status = ret;
+                    goto cleanup;
+                }
             }
         }
 
@@ -1150,38 +1170,28 @@ static BBPEStatus encode_chunk(BBPETokenizer *tok, const char *chunk, BBPEOutput
     for (TokenNode *node = head; node; node = node->next)
         token_count++;
 
-    int32_t *ids = (int32_t *)malloc(sizeof(int32_t) * token_count);
-    if (!ids)
-    {
-        heap_free(heap);
-        free(nodes);
-        return BBPE_ERR_MEMORY;
-    }
-
-    size_t idx = 0;
-    for (TokenNode *node = head; node; node = node->next)
-        ids[idx++] = node->id;
-
-    // 6. 追加到 out_accum
+    // 6. 直接扩展 out_accum 的 ids 数组，并填充
     size_t old_count = out_accum->count;
-    out_accum->count += token_count;
-    int32_t *new_ids = (int32_t *)realloc(out_accum->ids, sizeof(int32_t) * out_accum->count);
+    size_t new_count = old_count + token_count;
+    int32_t *new_ids = (int32_t *)realloc(out_accum->ids, sizeof(int32_t) * new_count);
     if (!new_ids)
     {
-        free(ids);
-        heap_free(heap);
-        free(nodes);
-        return BBPE_ERR_MEMORY;
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
     }
     out_accum->ids = new_ids;
-    memcpy(out_accum->ids + old_count, ids, token_count * sizeof(int32_t));
+    out_accum->count = new_count;
 
-    // 7. 清理
-    free(ids);
-    heap_free(heap);
-    free(nodes);
+    size_t idx = old_count;
+    for (TokenNode *node = head; node; node = node->next)
+        out_accum->ids[idx++] = node->id;
 
-    return BBPE_OK;
+cleanup:
+    if (heap)
+        heap_free(heap);
+    if (nodes)
+        free(nodes);
+    return status;
 }
 
 // ============================================================================
