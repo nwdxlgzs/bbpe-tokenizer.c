@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A lightweight, maybe high-performance C implementation of Byte-Level Byte Pair Encoding (BBPE) tokenization, compatible with HuggingFace's `tokenizer.json` format.
+A lightweight, maybe high-performance C implementation of Byte-Level Byte Pair Encoding (BBPE) tokenization, compatible with HuggingFace's `tokenizer.json` format.  
 一个轻量级可能算是高性能的字节级字节对编码（BBPE）分词器，使用 C 语言实现，兼容 HuggingFace 的 `tokenizer.json` 格式。
 
 Designed for fast inference with minimal memory footprint, ideal for embedding in C/C++ projects or language bindings.  
@@ -26,6 +26,8 @@ Designed for fast inference with minimal memory footprint, ideal for embedding i
   ✅ **优化的 BPE 合并** – 优先队列（最小堆），复杂度 O(n log n)
 - ✅ **Correct tie‑breaking** – when priorities are equal, leftmost merge is chosen (matches original linear scan)  
   ✅ **正确的优先级平局处理** – 优先级相同时选择最左边的合并（与原始线性扫描结果一致）
+- ✅ **Serialization support** – save and load tokenizer to/from a compact binary file (handles endianness)  
+  ✅ **序列化支持** – 将分词器保存到紧凑的二进制文件或从二进制文件加载（处理大小端）
 - ✅ **Clean C API** – opaque pointer, simple error codes  
   ✅ **简洁的 C API** – 不透明指针，简单错误码
 - ✅ **No global state** – thread‑safe when each tokenizer is used exclusively  
@@ -88,6 +90,19 @@ BBPEStatus bbpe_decode(BBPETokenizer *tokenizer, const int32_t *ids, size_t coun
 - Returns `BBPE_OK` on success.  
   成功返回 `BBPE_OK`。
 
+### Serialization / 序列化
+
+```c
+BBPEStatus bbpe_save(BBPETokenizer *tokenizer, const char *filename);
+BBPEStatus bbpe_load(const char *filename, BBPETokenizer **out_tokenizer);
+```
+- `bbpe_save` writes the tokenizer state to a binary file (little‑endian, with magic and version).  
+  `bbpe_save` 将分词器状态写入二进制文件（小端字节序，包含魔数和版本号）。
+- `bbpe_load` reads a previously saved binary file and reconstructs the tokenizer.  
+  `bbpe_load` 读取之前保存的二进制文件并重建分词器。
+- Both functions return `BBPE_OK` on success, or an appropriate error code (`BBPE_ERR_FILE_IO` for I/O errors, etc.).  
+  两个函数成功时返回 `BBPE_OK`，否则返回相应的错误码（如 I/O 错误返回 `BBPE_ERR_FILE_IO`）。
+
 ### Memory management / 内存管理
 
 ```c
@@ -107,6 +122,7 @@ void bbpe_destroy(BBPETokenizer *tokenizer);
 | `BBPE_ERR_TOKEN_NOT_FOUND`     | -5         | Token not found in vocabulary               | 词汇表中未找到 token                  |
 | `BBPE_ERR_INVALID_INPUT`       | -6         | Invalid input parameter                      | 输入参数无效                          |
 | `BBPE_ERR_UNSUPPORTED_TYPE`    | -7         | Unsupported pre‑tokenizer type               | 不支持的预分词器类型                  |
+| `BBPE_ERR_FILE_IO`             | -8         | File read/write error                        | 文件读写错误                          |
 
 ---
 
@@ -120,6 +136,8 @@ void bbpe_destroy(BBPETokenizer *tokenizer);
   **特殊 token** – 使用最长匹配扫描提取。重叠的特殊 token 会被正确处理。
 - **Pre‑tokenizer chain** – The implementation supports a sequence of pre‑tokenizers as defined in `tokenizer.json` (e.g., `Sequence` of `Split` + `ByteLevel`).  
   **预分词器链** – 实现支持 `tokenizer.json` 中定义的预分词器序列（例如 `Split` + `ByteLevel` 的 `Sequence`）。
+- **Serialization** – The binary format is portable across endianness (always stored as little‑endian).  
+  **序列化** – 二进制格式可跨大小端移植（始终以小端存储）。
 - **Memory ownership** – All output strings and arrays must be freed by the caller using the provided functions (`free()` for strings, `bbpe_free_output()` for `BBPEOutput`).  
   **内存所有权** – 所有输出的字符串和数组必须由调用者使用提供的函数释放（字符串用 `free()`，`BBPEOutput` 用 `bbpe_free_output()`）。
 - **Thread safety** – The tokenizer handle is not thread‑safe for concurrent calls. Use separate handles or external locking.  
