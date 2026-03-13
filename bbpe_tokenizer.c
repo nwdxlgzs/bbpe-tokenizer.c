@@ -1899,3 +1899,779 @@ void bbpe_destroy(BBPETokenizer *tokenizer)
     free(tokenizer->id_to_token);
     free(tokenizer);
 }
+
+// ============================================================================
+// 序列化/反序列化辅助函数 (小端字节序转换)
+// ============================================================================
+
+/**
+ * @brief 将主机字节序的32位无符号整数转换为小端字节序 (用于写入文件)
+ */
+static uint32_t host_to_le32(uint32_t val)
+{
+    uint32_t test = 1;
+    if (*(uint8_t *)&test == 1)
+    {
+        // 小端主机，无需转换
+        return val;
+    }
+    else
+    {
+        // 大端主机，转换为小端
+        return ((val >> 24) & 0xFF) |
+               ((val >> 8) & 0xFF00) |
+               ((val << 8) & 0xFF0000) |
+               ((val << 24) & 0xFF000000);
+    }
+}
+
+/**
+ * @brief 将小端字节序转换为主机字节序 (用于从文件读取)
+ */
+static uint32_t le32_to_host(uint32_t val)
+{
+    // 与 host_to_le32 相同，因为互为逆操作
+    uint32_t test = 1;
+    if (*(uint8_t *)&test == 1)
+    {
+        return val;
+    }
+    else
+    {
+        return ((val >> 24) & 0xFF) |
+               ((val >> 8) & 0xFF00) |
+               ((val << 8) & 0xFF0000) |
+               ((val << 24) & 0xFF000000);
+    }
+}
+
+/**
+ * @brief 从文件读取一个 uint32_t 小端，并转换为主机字节序
+ */
+static BBPEStatus read_u32_le(FILE *f, uint32_t *out)
+{
+    uint32_t val;
+    if (fread(&val, sizeof(val), 1, f) != 1)
+    {
+        return BBPE_ERR_FILE_IO;
+    }
+    *out = le32_to_host(val);
+    return BBPE_OK;
+}
+
+/**
+ * @brief 将一个主机字节序的 uint32_t 转换为小端后写入文件
+ */
+static BBPEStatus write_u32_le(FILE *f, uint32_t val)
+{
+    uint32_t le_val = host_to_le32(val);
+    if (fwrite(&le_val, sizeof(le_val), 1, f) != 1)
+    {
+        return BBPE_ERR_FILE_IO;
+    }
+    return BBPE_OK;
+}
+
+// ============================================================================
+// 序列化实现：bbpe_save
+// ============================================================================
+
+BBPEStatus bbpe_save(BBPETokenizer *tok, const char *filename)
+{
+    if (!tok || !filename)
+        return BBPE_ERR_INVALID_INPUT;
+
+    FILE *f = fopen(filename, "wb");
+    if (!f)
+        return BBPE_ERR_FILE_IO;
+
+    BBPEStatus status = BBPE_OK;
+    uint32_t tmp;
+    VocabEntry *v_cur, *v_tmp;
+    SpecialEntry *s_cur, *s_tmp;
+
+    // 1. 写入魔数 "BBPE"
+    if (fwrite("BBPE", 1, 4, f) != 4)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 2. 写入版本号 (1)
+    if (write_u32_le(f, 1) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 3. 写入词汇表条目数
+    uint32_t vocab_count = HASH_COUNT(tok->vocab_map);
+    if (write_u32_le(f, vocab_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 4. 写入每个词汇表条目
+    HASH_ITER(hh, tok->vocab_map, v_cur, v_tmp)
+    {
+        uint32_t len = (uint32_t)strlen(v_cur->token);
+        if (write_u32_le(f, len) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        if (fwrite(v_cur->token, 1, len, f) != len)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        if (write_u32_le(f, (uint32_t)v_cur->id) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+    }
+
+    // 5. 计算并写入合并规则总数
+    uint32_t merge_total = 0;
+    for (uint32_t left = 0; left < tok->vocab_size; left++)
+    {
+        merge_total += tok->rule_rows[left].count;
+    }
+    if (write_u32_le(f, merge_total) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 6. 写入所有合并规则 (left, right, new_id, priority)
+    for (uint32_t left = 0; left < tok->vocab_size; left++)
+    {
+        MergeRuleRow *row = &tok->rule_rows[left];
+        for (uint32_t j = 0; j < row->count; j++)
+        {
+            MergeRuleItem *item = &row->items[j];
+            if (write_u32_le(f, left) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            if (write_u32_le(f, (uint32_t)item->right_id) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            if (write_u32_le(f, (uint32_t)item->new_id) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            if (write_u32_le(f, (uint32_t)item->priority) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+        }
+    }
+
+    // 7. 写入特殊 token 条目数
+    uint32_t special_count = HASH_COUNT(tok->special_tokens_map);
+    if (write_u32_le(f, special_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 8. 写入每个特殊 token 条目
+    HASH_ITER(hh, tok->special_tokens_map, s_cur, s_tmp)
+    {
+        uint32_t len = (uint32_t)strlen(s_cur->token);
+        if (write_u32_le(f, len) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        if (fwrite(s_cur->token, 1, len, f) != len)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        if (write_u32_le(f, (uint32_t)s_cur->id) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+    }
+
+    // 9. 写入预分词器节点数
+    uint32_t pre_count = 0;
+    PreTokenizerNode *p_cur = tok->pre_tokenizers;
+    while (p_cur)
+    {
+        pre_count++;
+        p_cur = p_cur->next;
+    }
+    if (write_u32_le(f, pre_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 10. 写入每个预分词器节点
+    p_cur = tok->pre_tokenizers;
+    while (p_cur)
+    {
+        uint8_t type_byte = (uint8_t)p_cur->type;
+        if (fwrite(&type_byte, 1, 1, f) != 1)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+
+        switch (p_cur->type)
+        {
+        case PRE_TOKENIZER_BYTE_LEVEL:
+        {
+            uint8_t add_space = (uint8_t)p_cur->config.byte_level.add_prefix_space;
+            if (fwrite(&add_space, 1, 1, f) != 1)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            break;
+        }
+        case PRE_TOKENIZER_REGEX_SPLIT:
+        {
+            uint32_t pat_len = (uint32_t)strlen(p_cur->config.split.regex_pattern);
+            if (write_u32_le(f, pat_len) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            if (fwrite(p_cur->config.split.regex_pattern, 1, pat_len, f) != pat_len)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            break;
+        }
+        default:
+            status = BBPE_ERR_UNSUPPORTED_TYPE;
+            goto cleanup;
+        }
+        p_cur = p_cur->next;
+    }
+
+cleanup:
+    fclose(f);
+    return status;
+}
+
+// ============================================================================
+// 反序列化实现：bbpe_load
+// ============================================================================
+
+typedef struct
+{
+    char *token; // 已分配的字符串，将由 vocab 哈希表接管
+    int32_t id;
+} TempVocabEntry;
+
+typedef struct
+{
+    char *token; // 已分配的字符串，将由 special 哈希表接管
+    int32_t id;
+} TempSpecialEntry;
+
+BBPEStatus bbpe_load(const char *filename, BBPETokenizer **out_tokenizer)
+{
+    if (!filename || !out_tokenizer)
+        return BBPE_ERR_INVALID_INPUT;
+
+    FILE *f = fopen(filename, "rb");
+    if (!f)
+        return BBPE_ERR_FILE_IO;
+
+    BBPEStatus status = BBPE_OK;
+    BBPETokenizer *tok = NULL;
+    TempVocabEntry *temp_vocab = NULL;
+    size_t temp_vocab_cap = 0, temp_vocab_cnt = 0;
+    TempSpecialEntry *temp_special = NULL;
+    size_t temp_special_cap = 0, temp_special_cnt = 0;
+
+    // 读取魔数
+    char magic[4];
+    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, "BBPE", 4) != 0)
+    {
+        status = BBPE_ERR_INVALID_INPUT;
+        goto cleanup;
+    }
+
+    // 读取版本
+    uint32_t version;
+    if (read_u32_le(f, &version) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+    if (version != 1)
+    {
+        status = BBPE_ERR_UNSUPPORTED_TYPE;
+        goto cleanup;
+    }
+
+    // 分配主结构
+    tok = (BBPETokenizer *)calloc(1, sizeof(BBPETokenizer));
+    if (!tok)
+    {
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
+    }
+
+    // 读取词汇表条目数
+    uint32_t vocab_count;
+    if (read_u32_le(f, &vocab_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 临时存储词汇表
+    temp_vocab_cap = vocab_count > 0 ? vocab_count : 1;
+    temp_vocab = (TempVocabEntry *)malloc(temp_vocab_cap * sizeof(TempVocabEntry));
+    if (!temp_vocab)
+    {
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
+    }
+    memset(temp_vocab, 0, temp_vocab_cap * sizeof(TempVocabEntry));
+
+    uint32_t max_id = 0;
+    for (uint32_t i = 0; i < vocab_count; i++)
+    {
+        uint32_t len;
+        if (read_u32_le(f, &len) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        char *token_str = (char *)malloc(len + 1);
+        if (!token_str)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        if (fread(token_str, 1, len, f) != len)
+        {
+            free(token_str);
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        token_str[len] = '\0';
+
+        uint32_t id;
+        if (read_u32_le(f, &id) != BBPE_OK)
+        {
+            free(token_str);
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+
+        // 扩展临时数组
+        if (temp_vocab_cnt >= temp_vocab_cap)
+        {
+            temp_vocab_cap *= 2;
+            TempVocabEntry *new_arr = (TempVocabEntry *)realloc(temp_vocab, temp_vocab_cap * sizeof(TempVocabEntry));
+            if (!new_arr)
+            {
+                free(token_str);
+                status = BBPE_ERR_MEMORY;
+                goto cleanup;
+            }
+            temp_vocab = new_arr;
+        }
+
+        temp_vocab[temp_vocab_cnt].token = token_str;
+        temp_vocab[temp_vocab_cnt].id = (int32_t)id;
+        temp_vocab_cnt++;
+        if ((int32_t)id > (int32_t)max_id)
+            max_id = id;
+    }
+
+    // 读取合并规则总数
+    uint32_t merge_total;
+    if (read_u32_le(f, &merge_total) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    // 临时存储合并规则
+    typedef struct
+    {
+        int32_t left_id;
+        int32_t right_id;
+        int32_t new_id;
+        int32_t priority;
+    } MergeRecord;
+    MergeRecord *temp_merges = NULL;
+    if (merge_total > 0)
+    {
+        temp_merges = (MergeRecord *)malloc(merge_total * sizeof(MergeRecord));
+        if (!temp_merges)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        for (uint32_t i = 0; i < merge_total; i++)
+        {
+            uint32_t left, right, new_id, priority;
+            if (read_u32_le(f, &left) != BBPE_OK ||
+                read_u32_le(f, &right) != BBPE_OK ||
+                read_u32_le(f, &new_id) != BBPE_OK ||
+                read_u32_le(f, &priority) != BBPE_OK)
+            {
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            // 简单验证 id 范围 (词汇表 id 不应超过 max_id)
+            if ((int32_t)left > (int32_t)max_id || (int32_t)right > (int32_t)max_id || (int32_t)new_id > (int32_t)max_id)
+            {
+                status = BBPE_ERR_INVALID_INPUT;
+                goto cleanup;
+            }
+            temp_merges[i].left_id = (int32_t)left;
+            temp_merges[i].right_id = (int32_t)right;
+            temp_merges[i].new_id = (int32_t)new_id;
+            temp_merges[i].priority = (int32_t)priority;
+        }
+    }
+
+    // 读取特殊 token 条目数
+    uint32_t special_count;
+    if (read_u32_le(f, &special_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    temp_special_cap = special_count > 0 ? special_count : 1;
+    temp_special = (TempSpecialEntry *)malloc(temp_special_cap * sizeof(TempSpecialEntry));
+    if (!temp_special)
+    {
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
+    }
+    memset(temp_special, 0, temp_special_cap * sizeof(TempSpecialEntry));
+
+    for (uint32_t i = 0; i < special_count; i++)
+    {
+        uint32_t len;
+        if (read_u32_le(f, &len) != BBPE_OK)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        char *token_str = (char *)malloc(len + 1);
+        if (!token_str)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        if (fread(token_str, 1, len, f) != len)
+        {
+            free(token_str);
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+        token_str[len] = '\0';
+
+        uint32_t id;
+        if (read_u32_le(f, &id) != BBPE_OK)
+        {
+            free(token_str);
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+
+        if (temp_special_cnt >= temp_special_cap)
+        {
+            temp_special_cap *= 2;
+            TempSpecialEntry *new_arr = (TempSpecialEntry *)realloc(temp_special, temp_special_cap * sizeof(TempSpecialEntry));
+            if (!new_arr)
+            {
+                free(token_str);
+                status = BBPE_ERR_MEMORY;
+                goto cleanup;
+            }
+            temp_special = new_arr;
+        }
+
+        temp_special[temp_special_cnt].token = token_str;
+        temp_special[temp_special_cnt].id = (int32_t)id;
+        temp_special_cnt++;
+        if ((int32_t)id > (int32_t)max_id)
+            max_id = id;
+    }
+
+    // 现在 max_id 是最终最大 id，计算 vocab_size
+    tok->vocab_size = max_id + 1;
+
+    // 分配 id_to_token 数组
+    tok->id_to_token = (char **)calloc(tok->vocab_size, sizeof(char *));
+    if (!tok->id_to_token)
+    {
+        status = BBPE_ERR_MEMORY;
+        goto cleanup;
+    }
+
+    // 构建词汇表哈希表并填充 id_to_token
+    for (size_t i = 0; i < temp_vocab_cnt; i++)
+    {
+        VocabEntry *entry = (VocabEntry *)malloc(sizeof(VocabEntry));
+        if (!entry)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        entry->token = temp_vocab[i].token; // 接管字符串
+        entry->id = temp_vocab[i].id;
+        HASH_ADD_KEYPTR(hh, tok->vocab_map, entry->token, strlen(entry->token), entry);
+        if (entry->id >= 0 && entry->id < tok->vocab_size)
+        {
+            tok->id_to_token[entry->id] = entry->token;
+        }
+        // 将 temp_vocab 中的指针置空，避免后续重复释放
+        temp_vocab[i].token = NULL;
+    }
+
+    // 构建特殊 token 哈希表并填充 id_to_token
+    for (size_t i = 0; i < temp_special_cnt; i++)
+    {
+        // 检查 id 是否已被 vocab 占用 (可选，这里简单处理，如果冲突返回错误)
+        if (tok->id_to_token[temp_special[i].id] != NULL)
+        {
+            status = BBPE_ERR_INVALID_INPUT;
+            goto cleanup;
+        }
+        SpecialEntry *entry = (SpecialEntry *)malloc(sizeof(SpecialEntry));
+        if (!entry)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        entry->token = temp_special[i].token; // 接管字符串
+        entry->id = temp_special[i].id;
+        HASH_ADD_KEYPTR(hh, tok->special_tokens_map, entry->token, strlen(entry->token), entry);
+        tok->id_to_token[entry->id] = entry->token;
+        temp_special[i].token = NULL;
+    }
+
+    // 构建 rule_rows
+    if (merge_total > 0)
+    {
+        uint32_t *counts = (uint32_t *)calloc(tok->vocab_size, sizeof(uint32_t));
+        if (!counts)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+
+        // 统计每个 left 的规则数量
+        for (uint32_t i = 0; i < merge_total; i++)
+        {
+            int left = temp_merges[i].left_id;
+            if (left >= 0 && left < tok->vocab_size)
+            {
+                counts[left]++;
+            }
+        }
+
+        tok->rule_rows = (MergeRuleRow *)calloc(tok->vocab_size, sizeof(MergeRuleRow));
+        if (!tok->rule_rows)
+        {
+            free(counts);
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+
+        for (int left = 0; left < tok->vocab_size; left++)
+        {
+            if (counts[left] > 0)
+            {
+                tok->rule_rows[left].items = (MergeRuleItem *)malloc(counts[left] * sizeof(MergeRuleItem));
+                if (!tok->rule_rows[left].items)
+                {
+                    free(counts);
+                    status = BBPE_ERR_MEMORY;
+                    goto cleanup;
+                }
+                tok->rule_rows[left].count = counts[left];
+            }
+        }
+
+        // 重置 counts 用于填充
+        memset(counts, 0, tok->vocab_size * sizeof(uint32_t));
+        for (uint32_t i = 0; i < merge_total; i++)
+        {
+            int left = temp_merges[i].left_id;
+            uint32_t pos = counts[left]++;
+            MergeRuleItem *item = &tok->rule_rows[left].items[pos];
+            item->right_id = temp_merges[i].right_id;
+            item->new_id = temp_merges[i].new_id;
+            item->priority = temp_merges[i].priority;
+        }
+
+        // 对每个 left 的规则按 right_id 排序
+        for (int left = 0; left < tok->vocab_size; left++)
+        {
+            if (tok->rule_rows[left].count > 0)
+            {
+                qsort(tok->rule_rows[left].items, tok->rule_rows[left].count,
+                      sizeof(MergeRuleItem), compare_merge_rule_items);
+            }
+        }
+
+        free(counts);
+    }
+    else
+    {
+        tok->rule_rows = (MergeRuleRow *)calloc(tok->vocab_size, sizeof(MergeRuleRow));
+        if (!tok->rule_rows)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+    }
+
+    tok->merge_count = merge_total;
+
+    // 读取预分词器节点
+    uint32_t pre_count;
+    if (read_u32_le(f, &pre_count) != BBPE_OK)
+    {
+        status = BBPE_ERR_FILE_IO;
+        goto cleanup;
+    }
+
+    PreTokenizerNode *head = NULL, **tail = &head;
+    for (uint32_t i = 0; i < pre_count; i++)
+    {
+        uint8_t type_byte;
+        if (fread(&type_byte, 1, 1, f) != 1)
+        {
+            status = BBPE_ERR_FILE_IO;
+            goto cleanup;
+        }
+
+        PreTokenizerNode *node = (PreTokenizerNode *)calloc(1, sizeof(PreTokenizerNode));
+        if (!node)
+        {
+            status = BBPE_ERR_MEMORY;
+            goto cleanup;
+        }
+        node->type = (PreTokenizerType)type_byte;
+
+        switch (node->type)
+        {
+        case PRE_TOKENIZER_BYTE_LEVEL:
+        {
+            uint8_t add_space;
+            if (fread(&add_space, 1, 1, f) != 1)
+            {
+                free(node);
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            node->config.byte_level.add_prefix_space = add_space ? 1 : 0;
+            break;
+        }
+        case PRE_TOKENIZER_REGEX_SPLIT:
+        {
+            uint32_t pat_len;
+            if (read_u32_le(f, &pat_len) != BBPE_OK)
+            {
+                free(node);
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            char *pattern = (char *)malloc(pat_len + 1);
+            if (!pattern)
+            {
+                free(node);
+                status = BBPE_ERR_MEMORY;
+                goto cleanup;
+            }
+            if (fread(pattern, 1, pat_len, f) != pat_len)
+            {
+                free(pattern);
+                free(node);
+                status = BBPE_ERR_FILE_IO;
+                goto cleanup;
+            }
+            pattern[pat_len] = '\0';
+            node->config.split.regex_pattern = pattern;
+
+            int err;
+            PCRE2_SIZE err_off;
+            node->config.split.regex_compiled = pcre2_compile(
+                (PCRE2_SPTR)pattern, PCRE2_ZERO_TERMINATED,
+                PCRE2_UTF | PCRE2_UCP, &err, &err_off, NULL);
+            if (!node->config.split.regex_compiled)
+            {
+                free(pattern);
+                free(node);
+                status = BBPE_ERR_REGEX_COMPILE;
+                goto cleanup;
+            }
+            break;
+        }
+        default:
+            free(node);
+            status = BBPE_ERR_UNSUPPORTED_TYPE;
+            goto cleanup;
+        }
+
+        *tail = node;
+        tail = &node->next;
+    }
+    tok->pre_tokenizers = head;
+
+    // 初始化字节映射和预计算字符串
+    init_byte_mappings(tok);
+    precompute_byte_strings(tok);
+
+    *out_tokenizer = tok;
+    tok = NULL; // 防止被 cleanup 释放
+    status = BBPE_OK;
+
+cleanup:
+    if (f)
+        fclose(f);
+
+    // 释放临时词汇表条目中未被接管的字符串
+    if (temp_vocab)
+    {
+        for (size_t i = 0; i < temp_vocab_cnt; i++)
+        {
+            free(temp_vocab[i].token);
+        }
+        free(temp_vocab);
+    }
+    if (temp_special)
+    {
+        for (size_t i = 0; i < temp_special_cnt; i++)
+        {
+            free(temp_special[i].token);
+        }
+        free(temp_special);
+    }
+    free(temp_merges);
+
+    if (status != BBPE_OK && tok)
+    {
+        bbpe_destroy(tok);
+    }
+    return status;
+}
