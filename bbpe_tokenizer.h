@@ -14,14 +14,15 @@ extern "C"
      */
     typedef enum
     {
-        BBPE_OK = 0,                   /* 成功 */
-        BBPE_ERR_MEMORY = -1,          /* 内存分配失败 */
-        BBPE_ERR_JSON_PARSE = -2,      /* JSON 解析失败 */
-        BBPE_ERR_VOCAB_MISSING = -3,   /* 词汇表缺失 */
-        BBPE_ERR_REGEX_COMPILE = -4,   /* 正则表达式编译失败 */
-        BBPE_ERR_TOKEN_NOT_FOUND = -5, /* Token 未找到 */
-        BBPE_ERR_INVALID_INPUT = -6,   /* 输入参数无效 */
-        BBPE_ERR_UNSUPPORTED_TYPE = -7 /* 不支持的预分词器类型 */
+        BBPE_OK = 0,                    /* 成功 */
+        BBPE_ERR_MEMORY = -1,           /* 内存分配失败 */
+        BBPE_ERR_JSON_PARSE = -2,       /* JSON 解析失败 */
+        BBPE_ERR_VOCAB_MISSING = -3,    /* 词汇表缺失 */
+        BBPE_ERR_REGEX_COMPILE = -4,    /* 正则表达式编译失败 */
+        BBPE_ERR_TOKEN_NOT_FOUND = -5,  /* Token 未找到 */
+        BBPE_ERR_INVALID_INPUT = -6,    /* 输入参数无效 */
+        BBPE_ERR_UNSUPPORTED_TYPE = -7, /* 不支持的预分词器类型 */
+        BBPE_ERR_FILE_IO = -8,          /* 文件读写错误 */
     } BBPEStatus;
 
     /**
@@ -76,6 +77,22 @@ extern "C"
      * @param tokenizer 分词器句柄
      */
     void bbpe_destroy(BBPETokenizer *tokenizer);
+
+    /**
+     * @brief 将分词器序列化保存到二进制文件
+     * @param tokenizer 分词器句柄
+     * @param filename 文件名
+     * @return BBPEStatus
+     */
+    BBPEStatus bbpe_save(BBPETokenizer *tokenizer, const char *filename);
+
+    /**
+     * @brief 从二进制文件加载分词器
+     * @param filename 文件名
+     * @param out_tokenizer 输出分词器句柄的指针
+     * @return BBPEStatus
+     */
+    BBPEStatus bbpe_load(const char *filename, BBPETokenizer **out_tokenizer);
 
 #ifdef __cplusplus
 }
